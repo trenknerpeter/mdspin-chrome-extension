@@ -46,6 +46,29 @@ function isSupportedFile(name: string): boolean {
 // ── File Interception ──────────────────────────────────────────────
 
 function interceptFiles() {
+  // Intercept drops from the MDSpin popup (File objects don't cross the extension boundary,
+  // so the popup stores markdown in chrome.storage.session and sets a text marker instead)
+  document.addEventListener("drop", async (e) => {
+    const text = e.dataTransfer?.getData("text/plain") ?? "";
+    if (!text.startsWith("MDSPIN_DROP:")) return;
+
+    // Block the host page (ChatGPT/Claude/Gemini) from inserting the marker as text
+    e.preventDefault();
+    e.stopImmediatePropagation();
+
+    const filename = text.slice("MDSPIN_DROP:".length);
+    console.log(`[MDSpin] Detected popup drag-drop for: ${filename}`);
+
+    // Retrieve markdown via background worker relay (direct storage access is blocked by CSP)
+    const pending = await chrome.runtime.sendMessage({ type: "GET_PENDING_DROP" });
+    if (!pending?.markdown) {
+      console.warn("[MDSpin] No pending markdown found in background worker");
+      return;
+    }
+
+    await injectFileAsAttachment(pending.markdown, filename);
+  }, true);
+
   document.addEventListener("drop", (e) => {
     const files = e.dataTransfer?.files;
     if (!files) return;

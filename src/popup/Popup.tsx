@@ -316,9 +316,20 @@ export function Popup() {
 
   function handleDragStartMd(e: DragEvent) {
     if (state.kind !== "result") return;
-    const mdFile = new File([state.markdown], getMdFileName(state.fileName), { type: "text/markdown" });
-    e.dataTransfer!.items.add(mdFile);
+    const mdFileName = getMdFileName(state.fileName);
+    // Store markdown via background worker (content scripts can't access storage directly due to CSP)
+    chrome.runtime.sendMessage({
+      type: "STORE_PENDING_DROP",
+      markdown: state.markdown,
+      filename: mdFileName,
+    });
+    // Set a text marker the content script can detect (File objects don't cross the extension boundary)
+    e.dataTransfer!.setData("text/plain", `MDSPIN_DROP:${mdFileName}`);
     e.dataTransfer!.effectAllowed = "copy";
+  }
+
+  function handleDragEndMd() {
+    chrome.runtime.sendMessage({ type: "CLEAR_PENDING_DROP" });
   }
 
   function reset() {
@@ -578,7 +589,7 @@ export function Popup() {
                 </div>
 
                 {/* MD file */}
-                <div draggable={true} onDragStart={handleDragStartMd} class="flex flex-col items-center gap-1.5 cursor-grab active:cursor-grabbing" style={{ animation: "fade-in-up 0.4s ease 0.5s both" }}>
+                <div draggable={true} onDragStart={handleDragStartMd} onDragEnd={handleDragEndMd} class="flex flex-col items-center gap-1.5 cursor-grab active:cursor-grabbing" style={{ animation: "fade-in-up 0.4s ease 0.5s both" }}>
                   <div class="w-14 h-14 rounded-xl flex items-center justify-center" style={{ background: "#1E1E1E", border: "1.5px solid #FF4800" }}>
                     <span class="text-sm font-bold" style={{ color: "#F0EDE8" }}>MD</span>
                   </div>

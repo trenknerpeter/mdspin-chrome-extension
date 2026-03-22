@@ -3,7 +3,29 @@ const API_KEY = "ac6c6f8590ff760c98d519ab34198d6282bbdac2a056a809bbf74329630b474
 
 console.log("[MDSpin BG] Service worker loaded");
 
+// In-memory store for the pending drag-drop payload (popup → content script relay)
+let pendingDrop: { markdown: string; filename: string } | null = null;
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "STORE_PENDING_DROP") {
+    pendingDrop = { markdown: message.markdown, filename: message.filename };
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message.type === "GET_PENDING_DROP") {
+    const result = pendingDrop;
+    pendingDrop = null;
+    sendResponse(result);
+    return true;
+  }
+
+  if (message.type === "CLEAR_PENDING_DROP") {
+    pendingDrop = null;
+    sendResponse({ ok: true });
+    return true;
+  }
+
   if (message.type === "CONVERT_FILE") {
     console.log("[MDSpin BG] Received CONVERT_FILE:", message.fileName);
     convertFile(message)

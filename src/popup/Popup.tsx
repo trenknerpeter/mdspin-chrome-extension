@@ -80,6 +80,20 @@ export function Popup() {
       setInlineEnabled(result.inlineButtonEnabled ?? true);
     });
 
+    // Restore last conversion result (if within 24h)
+    chrome.storage.local.get("lastConversion", (result) => {
+      const cached = result.lastConversion;
+      if (cached?.convertedAt) {
+        const age = Date.now() - new Date(cached.convertedAt).getTime();
+        const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
+        if (age < TWENTY_FOUR_HOURS) {
+          setState({ kind: "result", markdown: cached.markdownText, fileName: cached.fileName, wordCount: cached.wordCount });
+        } else {
+          chrome.storage.local.remove("lastConversion");
+        }
+      }
+    });
+
     // Load existing Supabase session
     supabase.auth.getSession().then(({ data }) => {
       setUser(data.session?.user ?? null);
@@ -261,6 +275,7 @@ export function Popup() {
     }
     originalFileRef.current = file;
     setState({ kind: "converting", fileName: file.name });
+    chrome.storage.local.remove("lastConversion");
     try {
       const response = await chrome.runtime.sendMessage({
         type: "CONVERT_FILE",
@@ -271,7 +286,11 @@ export function Popup() {
       if (response.error) {
         setState({ kind: "error", message: response.error });
       } else {
-        setState({ kind: "result", markdown: response.markdown, fileName: file.name, wordCount: countWords(response.markdown) });
+        const wordCount = countWords(response.markdown);
+        setState({ kind: "result", markdown: response.markdown, fileName: file.name, wordCount });
+        chrome.storage.local.set({
+          lastConversion: { markdownText: response.markdown, fileName: file.name, wordCount, convertedAt: new Date().toISOString() },
+        });
       }
     } catch {
       setState({ kind: "error", message: "Conversion failed. Please try again." });
@@ -336,6 +355,7 @@ export function Popup() {
     setState({ kind: "idle" });
     setCopied(false);
     originalFileRef.current = null;
+    chrome.storage.local.remove("lastConversion");
   }
 
   // ── User avatar initial ───────────────────────────────────────────

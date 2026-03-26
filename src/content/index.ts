@@ -13,6 +13,7 @@
 import type { SiteAdapter } from "./adapter";
 import { delay } from "./adapter";
 import { ChatGPTAdapter } from "./chatgpt";
+import { ClaudeAdapter } from "./claude";
 import { GeminiAdapter } from "./gemini";
 
 // ── Site Detection & Adapter ─────────────────────────────────────
@@ -29,6 +30,7 @@ function detectSite(): string | null {
 function createAdapter(site: string): SiteAdapter | null {
   switch (site) {
     case "chatgpt": return new ChatGPTAdapter();
+    case "claude":  return new ClaudeAdapter();
     case "gemini":  return new GeminiAdapter();
     default:        return null;
   }
@@ -93,6 +95,12 @@ function interceptFiles() {
 
     const filename = text.slice("MDSPIN_DROP:".length);
     console.log(`[MDSpin] Detected popup drag-drop for: ${filename}`);
+
+    // Dispatch a clean drop event (without our marker) so the host page
+    // can dismiss any drag-over overlay it may have shown
+    const cleanDt = new DataTransfer();
+    const cleanDrop = new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: cleanDt });
+    (e.target as HTMLElement).dispatchEvent(cleanDrop);
 
     // Retrieve markdown via background worker relay
     const pending = await chrome.runtime.sendMessage({ type: "GET_PENDING_DROP" });

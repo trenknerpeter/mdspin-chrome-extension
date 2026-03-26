@@ -40,6 +40,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "INJECT_MD_FILE_GEMINI") {
+    const tabId = sender.tab?.id;
+    if (!tabId) {
+      sendResponse({ success: false, error: "No tab ID" });
+      return true;
+    }
+    console.log("[MDSpin BG] Injecting .md file in MAIN world (Gemini):", message.mdFilename);
+
+    chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: geminiMainWorldInjectFile,
+      args: [message.markdown, message.mdFilename],
+    })
+      .then((results) => {
+        console.log("[MDSpin BG] Gemini injection result:", results);
+        sendResponse({ success: true });
+      })
+      .catch((err) => {
+        console.error("[MDSpin BG] Gemini injection error:", err);
+        sendResponse({ success: false, error: String(err) });
+      });
+    return true;
+  }
+
   if (message.type === "INJECT_MD_FILE") {
     const tabId = sender.tab?.id;
     if (!tabId) {
@@ -153,6 +178,56 @@ function mainWorldInjectFile(markdown: string, mdFilename: string) {
   input.dispatchEvent(new Event("change", { bubbles: true }));
   console.log("[MDSpin MAIN] Dispatched native change event");
 
+  return true;
+}
+
+/**
+ * Runs in Gemini's MAIN world — inserts markdown as text into the Quill editor.
+ *
+ * File attachment is impossible on Gemini (no file inputs, isTrusted blocks
+ * synthetic drag-drop). Instead we insert text directly into the editor.
+ */
+function geminiMainWorldInjectFile(markdown: string, _mdFilename: string): boolean {
+  const TAG = "[MDSpin MAIN Gemini]";
+  console.log(`${TAG} Inserting text, length:`, markdown.length);
+
+  const editor = document.querySelector<HTMLElement>('div.ql-editor[role="textbox"]');
+  if (!editor) {
+    console.error(`${TAG} Quill editor not found`);
+    return false;
+  }
+
+  // Focus the editor
+  editor.focus();
+
+  // Clear the placeholder class if present (Quill adds ql-blank when empty)
+  editor.classList.remove("ql-blank");
+
+  // Try execCommand first — works well with contenteditable and Quill
+  const success = document.execCommand("insertText", false, markdown);
+  if (success) {
+    console.log(`${TAG} Text inserted via execCommand`);
+    // Dispatch input event so Angular detects the change
+    editor.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  }
+
+  // Fallback: directly set content and fire events
+  console.log(`${TAG} execCommand failed, using direct insertion`);
+  const p = document.createElement("p");
+  p.textContent = markdown;
+  editor.innerHTML = "";
+  editor.appendChild(p);
+
+  // Fire input events for Angular/Quill to pick up
+  editor.dispatchEvent(new Event("input", { bubbles: true }));
+  editor.dispatchEvent(new InputEvent("input", {
+    bubbles: true,
+    inputType: "insertText",
+    data: markdown,
+  }));
+
+  console.log(`${TAG} Text inserted via direct DOM`);
   return true;
 }
 

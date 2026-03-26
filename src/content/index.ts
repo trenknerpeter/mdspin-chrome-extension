@@ -5,9 +5,39 @@
  *
  * Uses a Shadow DOM container to isolate styles and prevent
  * interference with the host page's UI.
+ *
+ * Platform-specific logic is delegated to site adapters
+ * (see chatgpt.ts, gemini.ts).
  */
 
+import type { SiteAdapter } from "./adapter";
+import { delay } from "./adapter";
+import { ChatGPTAdapter } from "./chatgpt";
+import { GeminiAdapter } from "./gemini";
+
+// ── Site Detection & Adapter ─────────────────────────────────────
+
+function detectSite(): string | null {
+  const host = location.hostname;
+  if (host.includes("chatgpt.com") || host.includes("chat.openai.com"))
+    return "chatgpt";
+  if (host.includes("claude.ai")) return "claude";
+  if (host.includes("gemini.google.com")) return "gemini";
+  return null;
+}
+
+function createAdapter(site: string): SiteAdapter | null {
+  switch (site) {
+    case "chatgpt": return new ChatGPTAdapter();
+    case "gemini":  return new GeminiAdapter();
+    default:        return null;
+  }
+}
+
 const SITE = detectSite();
+const adapter = SITE ? createAdapter(SITE) : null;
+
+// ── Constants & State ────────────────────────────────────────────
 
 const SUPPORTED_EXTENSIONS = new Set([
   "pdf", "docx", "pptx", "txt", "html", "rtf", "csv",
@@ -29,18 +59,23 @@ let inlineButtonsEnabled = true;
 let shadowHost: HTMLDivElement | null = null;
 let shadowRoot: ShadowRoot | null = null;
 
-function detectSite(): string | null {
-  const host = location.hostname;
-  if (host.includes("chatgpt.com") || host.includes("chat.openai.com"))
-    return "chatgpt";
-  if (host.includes("claude.ai")) return "claude";
-  if (host.includes("gemini.google.com")) return "gemini";
-  return null;
-}
+// ── Utilities ────────────────────────────────────────────────────
 
 function isSupportedFile(name: string): boolean {
   const ext = name.split(".").pop()?.toLowerCase() ?? "";
   return SUPPORTED_EXTENSIONS.has(ext);
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      resolve(result.split(",")[1]);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
 }
 
 // ── File Interception ──────────────────────────────────────────────
@@ -52,21 +87,32 @@ function interceptFiles() {
     const text = e.dataTransfer?.getData("text/plain") ?? "";
     if (!text.startsWith("MDSPIN_DROP:")) return;
 
-    // Block the host page (ChatGPT/Claude/Gemini) from inserting the marker as text
+    // Block the host page from inserting the marker as text
     e.preventDefault();
     e.stopImmediatePropagation();
 
     const filename = text.slice("MDSPIN_DROP:".length);
     console.log(`[MDSpin] Detected popup drag-drop for: ${filename}`);
 
-    // Retrieve markdown via background worker relay (direct storage access is blocked by CSP)
+    // Retrieve markdown via background worker relay
     const pending = await chrome.runtime.sendMessage({ type: "GET_PENDING_DROP" });
     if (!pending?.markdown) {
       console.warn("[MDSpin] No pending markdown found in background worker");
       return;
     }
 
-    await injectFileAsAttachment(pending.markdown, filename);
+    if (adapter) {
+      // Write to clipboard early while user gesture is fresh
+      try {
+        await navigator.clipboard.writeText(pending.markdown);
+      } catch { /* will retry later if needed */ }
+
+      const injected = await adapter.injectFileAsAttachment(pending.markdown, filename);
+      if (!injected) {
+        // Clipboard was already written above — user can paste
+        console.log("[MDSpin] Injection failed, markdown copied to clipboard");
+      }
+    }
   }, true);
 
   document.addEventListener("drop", (e) => {
@@ -105,21 +151,11 @@ function interceptFiles() {
   }, true);
 }
 
-// ── Composer Focus Tracking (Item #5) ──────────────────────────────
-
-function getComposerArea(): HTMLElement | null {
-  return (
-    document.querySelector<HTMLElement>('form[class*="composer"]') ??
-    document.querySelector<HTMLElement>('#prompt-textarea')?.closest('form') as HTMLElement ??
-    document.querySelector<HTMLElement>('form') ??
-    document.querySelector<HTMLElement>('[class*="composer"]')
-  );
-}
+// ── Composer Focus Tracking ──────────────────────────────────────
 
 function setupFocusTracking() {
-  // Use focusin/focusout on the document — these bubble, unlike focus/blur
   document.addEventListener("focusin", (e) => {
-    const composer = getComposerArea();
+    const composer = adapter?.getComposerArea();
     if (composer && composer.contains(e.target as Node)) {
       composerFocused = true;
       updateButtonVisibility();
@@ -127,13 +163,11 @@ function setupFocusTracking() {
   });
 
   document.addEventListener("focusout", (e) => {
-    const composer = getComposerArea();
+    const composer = adapter?.getComposerArea();
     if (composer && composer.contains(e.target as Node)) {
-      // Delay to allow focus to settle (e.g. clicking the MDSpin button itself)
       setTimeout(() => {
         const active = document.activeElement;
         const stillInComposer = composer.contains(active);
-        // Also check if the active element is inside our shadow root
         const isMdspinBtn = shadowRoot?.activeElement?.hasAttribute("data-mdspin-file") ||
                             active?.hasAttribute("data-mdspin-file") ||
                             active?.closest("[data-mdspin-file]");
@@ -145,15 +179,12 @@ function setupFocusTracking() {
     }
   });
 
-  // Also show buttons when there are files attached (user just uploaded)
-  // even if focus hasn't explicitly entered the composer yet
   document.addEventListener("click", (e) => {
-    const composer = getComposerArea();
+    const composer = adapter?.getComposerArea();
     if (composer && composer.contains(e.target as Node)) {
       composerFocused = true;
       updateButtonVisibility();
     } else {
-      // Clicked outside composer — but check if it's the MDSpin button (in shadow root)
       const target = e.target as HTMLElement;
       const isMdspinHost = target === shadowHost || target.id === "mdspin-root";
       if (!isMdspinHost && !target.hasAttribute("data-mdspin-file") && !target.closest("[data-mdspin-file]")) {
@@ -193,7 +224,6 @@ function createShadowHost(): { host: HTMLDivElement; root: ShadowRoot } {
 
   const root = host.attachShadow({ mode: "open" });
 
-  // Inject all styles (including keyframes) inside the shadow root
   const style = document.createElement("style");
   style.textContent = `
     @keyframes mdspin-rotate {
@@ -269,7 +299,6 @@ function createButton(fileName: string): HTMLButtonElement {
     handleConvert(btn, fileName);
   });
 
-  // Append to shadow root (not document.body)
   root.appendChild(btn);
 
   return btn;
@@ -303,10 +332,7 @@ async function handleConvert(btn: HTMLButtonElement, fileName: string) {
     return;
   }
 
-  // Mark as converting
   convertingFiles.add(fileName);
-
-  // Start spinning animation
   startSpinAnimation(btn);
   btn.style.pointerEvents = "none";
 
@@ -330,7 +356,6 @@ async function handleConvert(btn: HTMLButtonElement, fileName: string) {
       stopSpinAnimation(btn);
       btn.title = `Error: ${errMsg}`;
       btn.style.pointerEvents = "auto";
-      // Flash red border
       btn.style.outline = "2px solid #ef4444";
       setTimeout(() => {
         btn.style.outline = "none";
@@ -339,29 +364,43 @@ async function handleConvert(btn: HTMLButtonElement, fileName: string) {
       return;
     }
 
-    // Stop spinning
     stopSpinAnimation(btn);
 
-    // Try to inject the markdown as a native .md file attachment
     const mdFilename = file.name.replace(/\.[^.]+$/, ".md");
-    const injected = await injectFileAsAttachment(response.markdown, mdFilename);
+
+    // Write to clipboard EARLY while user gesture is still valid
+    // (injection attempts can take seconds and exhaust the gesture timeout)
+    let clipboardWritten = false;
+    try {
+      await navigator.clipboard.writeText(response.markdown);
+      clipboardWritten = true;
+    } catch {
+      // Will retry after injection attempt
+    }
+
+    const injected = adapter
+      ? await adapter.injectFileAsAttachment(response.markdown, mdFilename)
+      : false;
 
     if (injected) {
-      // Show success — green check overlay briefly
       btn.style.outline = "2px solid #16a34a";
-      btn.title = "MD file attached!";
+      btn.title = "Markdown inserted!";
     } else {
-      // Fallback: copy to clipboard — refocus page first
-      try {
-        // Focus the prompt textarea so the document is focused
-        const textarea = document.querySelector<HTMLElement>("#prompt-textarea");
-        if (textarea) textarea.focus();
-        await new Promise((r) => setTimeout(r, 100));
-        await navigator.clipboard.writeText(response.markdown);
-        btn.title = "Copied to clipboard!";
+      // Fallback: clipboard (may already be written)
+      if (!clipboardWritten) {
+        try {
+          adapter?.refocusComposer();
+          await delay(100);
+          await navigator.clipboard.writeText(response.markdown);
+          clipboardWritten = true;
+        } catch (clipErr) {
+          console.warn("[MDSpin] Clipboard also failed:", clipErr);
+        }
+      }
+      if (clipboardWritten) {
+        btn.title = "Copied to clipboard — paste with Ctrl+V";
         btn.style.outline = "2px solid #FF4800";
-      } catch (clipErr) {
-        console.warn("[MDSpin] Clipboard also failed:", clipErr);
+      } else {
         btn.title = "Conversion done — paste from clipboard";
         btn.style.outline = "2px solid #FF4800";
       }
@@ -383,245 +422,17 @@ async function handleConvert(btn: HTMLButtonElement, fileName: string) {
   }
 }
 
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      resolve(result.split(",")[1]);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
-// ── File Attachment Injection ──────────────────────────────────────
-
-/**
- * Snapshot the current file chip DOM elements so we can detect new ones.
- * Returns a Set of textContent strings from chip-like elements.
- */
-function snapshotChipTexts(): Set<string> {
-  const composer = getComposerArea();
-  if (!composer) return new Set();
-  const texts = new Set<string>();
-  // Walk the composer DOM looking for small elements (file chips have short text)
-  const walker = document.createTreeWalker(composer, NodeFilter.SHOW_ELEMENT);
-  let node = walker.nextNode();
-  while (node) {
-    const el = node as HTMLElement;
-    const t = el.textContent?.trim() ?? "";
-    if (t.length > 2 && t.length < 100) {
-      texts.add(t);
-    }
-    node = walker.nextNode();
-  }
-  return texts;
-}
-
-/** Check if a new chip appeared by comparing snapshots */
-function hasNewChip(before: Set<string>, mdFilename: string): boolean {
-  const after = snapshotChipTexts();
-  // Look for any new text that contains ".md" and wasn't there before
-  for (const text of after) {
-    if (!before.has(text) && (text.includes(".md") || text.includes(mdFilename.replace(".md", "")))) {
-      console.log("[MDSpin] New chip text detected:", text);
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * CRITICAL: Refocus ChatGPT's composer before injecting files.
- * Clicking the Shadow DOM button steals focus, which can prevent
- * ChatGPT from processing file input changes.
- */
-function refocusComposer() {
-  const textarea = document.querySelector<HTMLElement>("#prompt-textarea");
-  if (textarea) {
-    textarea.focus();
-    console.log("[MDSpin] Refocused prompt textarea");
-  }
-}
-
-async function injectFileAsAttachment(
-  markdown: string,
-  mdFilename: string
-): Promise<boolean> {
-
-  // CRITICAL: Restore focus to ChatGPT's composer before any injection attempt
-  refocusComposer();
-  await new Promise((r) => setTimeout(r, 200));
-
-  const chipsBefore = snapshotChipTexts();
-  console.log("[MDSpin] Chips before injection:", chipsBefore.size, "texts");
-
-  // === Approach A: MAIN world injection (full React access) ===
-  console.log("[MDSpin] Trying Approach A: MAIN world injection...");
-  try {
-    const resp = await chrome.runtime.sendMessage({
-      type: "INJECT_MD_FILE",
-      markdown,
-      mdFilename,
-    });
-    console.log("[MDSpin] MAIN world response:", resp);
-
-    await new Promise((r) => setTimeout(r, 1500));
-    if (hasNewChip(chipsBefore, mdFilename)) {
-      console.log("[MDSpin] Approach A succeeded!");
-      return true;
-    }
-    console.log("[MDSpin] Approach A: no new .md chip detected");
-  } catch (err) {
-    console.error("[MDSpin] Approach A error:", err);
-  }
-
-  // === Approach B: Original simple file input (worked in previous session) ===
-  // Refocus again in case Approach A disrupted it
-  refocusComposer();
-  await new Promise((r) => setTimeout(r, 200));
-
-  console.log("[MDSpin] Trying Approach B: simple file input (original)...");
-  try {
-    const mdFile = new File([markdown], mdFilename, {
-      type: "text/markdown",
-      lastModified: Date.now(),
-    });
-
-    let input = document.querySelector<HTMLInputElement>('input[type="file"]');
-    if (!input) {
-      console.log("[MDSpin] No file input found");
-    } else {
-      console.log("[MDSpin] Found file input:", input.id, "accept:", input.accept);
-
-      const dt = new DataTransfer();
-      dt.items.add(mdFile);
-      input.files = dt.files;
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-      // React's onChange fires for file inputs from synthetic events
-
-      console.log("[MDSpin] Dispatched change event, files:", input.files?.length);
-
-      await new Promise((r) => setTimeout(r, 1500));
-      if (hasNewChip(chipsBefore, mdFilename)) {
-        console.log("[MDSpin] Approach B succeeded!");
-        return true;
-      }
-      console.log("[MDSpin] Approach B: no new .md chip detected");
-    }
-  } catch (err) {
-    console.error("[MDSpin] Approach B error:", err);
-  }
-
-  // === Approach C: Drag-and-drop on composer ===
-  refocusComposer();
-  await new Promise((r) => setTimeout(r, 200));
-
-  console.log("[MDSpin] Trying Approach C: drag-and-drop...");
-  try {
-    const mdFile = new File([markdown], mdFilename, {
-      type: "text/markdown",
-      lastModified: Date.now(),
-    });
-
-    const dropTarget =
-      document.querySelector<HTMLElement>('form[class*="composer"]') ??
-      document.querySelector<HTMLElement>('#prompt-textarea')?.closest('form') as HTMLElement ??
-      document.querySelector<HTMLElement>("#prompt-textarea");
-
-    if (dropTarget) {
-      const dt = new DataTransfer();
-      dt.items.add(mdFile);
-      const opts = { bubbles: true, cancelable: true, dataTransfer: dt };
-      dropTarget.dispatchEvent(new DragEvent("dragenter", opts));
-      dropTarget.dispatchEvent(new DragEvent("dragover", opts));
-      dropTarget.dispatchEvent(new DragEvent("drop", opts));
-
-      await new Promise((r) => setTimeout(r, 1500));
-      if (hasNewChip(chipsBefore, mdFilename)) {
-        console.log("[MDSpin] Approach C succeeded!");
-        return true;
-      }
-      console.log("[MDSpin] Approach C: no new .md chip detected");
-    }
-  } catch (err) {
-    console.error("[MDSpin] Approach C error:", err);
-  }
-
-  console.log("[MDSpin] All injection approaches failed — falling back to clipboard");
-  return false;
-}
-
-// ── File Chip Detection ────────────────────────────────────────────
-
-function findFileChipForName(fileName: string): Element | null {
-  const composerArea = getComposerArea();
-  if (!composerArea) return null;
-
-  const walker = document.createTreeWalker(
-    composerArea,
-    NodeFilter.SHOW_ELEMENT,
-    {
-      acceptNode(node) {
-        const el = node as HTMLElement;
-        const text = el.textContent?.trim() ?? "";
-        if (!text.includes(fileName.replace(/\.[^.]+$/, "").substring(0, 20))) {
-          return NodeFilter.FILTER_REJECT;
-        }
-        return NodeFilter.FILTER_ACCEPT;
-      },
-    }
-  );
-
-  let best: Element | null = null;
-  let bestLen = Infinity;
-
-  let current = walker.nextNode();
-  while (current) {
-    const el = current as HTMLElement;
-    const len = el.textContent?.length ?? Infinity;
-    if (len < bestLen && len < 200) {
-      best = el;
-      bestLen = len;
-    }
-    current = walker.nextNode();
-  }
-
-  return best;
-}
-
-/**
- * Finds the actual rounded prompt box (not a full-width wrapper)
- * by looking for the visible container around the textarea/chip.
- */
-function findPromptBox(): HTMLElement | null {
-  const textarea = document.querySelector<HTMLElement>("#prompt-textarea");
-  if (!textarea) return null;
-
-  let el: HTMLElement | null = textarea;
-  while (el && el !== document.body) {
-    const rect = el.getBoundingClientRect();
-    if (rect.width > 100 && rect.width < window.innerWidth * 0.9) {
-      if (rect.height > 50) {
-        return el;
-      }
-    }
-    el = el.parentElement;
-  }
-  return null;
-}
+// ── Button Positioning ─────────────────────────────────────────────
 
 const BTN_SIZE = 36;
 const BTN_GAP = 10;
 
 function positionButton(btn: HTMLElement) {
-  const promptBox = findPromptBox();
+  const promptBox = adapter?.findPromptBox();
   if (!promptBox) return;
 
   const boxRect = promptBox.getBoundingClientRect();
 
-  // Center horizontally above the prompt box, with a gap above the top edge
   Object.assign(btn.style, {
     left: `${boxRect.left + boxRect.width / 2 - BTN_SIZE / 2}px`,
     top: `${boxRect.top - BTN_SIZE - BTN_GAP}px`,
@@ -638,7 +449,7 @@ function injectButtons() {
       continue;
     }
 
-    const chip = findFileChipForName(fileName);
+    const chip = adapter?.findFileChipForName(fileName);
     if (!chip) continue;
 
     if (processedChips.has(chip)) continue;
@@ -670,17 +481,10 @@ function startPositionTracking() {
   rafId = requestAnimationFrame(tick);
 }
 
-function stopPositionTracking() {
-  if (rafId !== null) {
-    cancelAnimationFrame(rafId);
-    rafId = null;
-  }
-}
-
 // ── Main ───────────────────────────────────────────────────────────
 
 function init() {
-  if (!SITE) return;
+  if (!SITE || !adapter) return;
 
   console.log(`[MDSpin] Active on ${SITE}`);
 
@@ -700,7 +504,7 @@ function init() {
     }
   });
 
-  // Also watch for storage changes (in case popup changes it while content script is running)
+  // Watch for storage changes
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === "local" && changes.inlineButtonEnabled) {
       inlineButtonsEnabled = changes.inlineButtonEnabled.newValue ?? true;
@@ -708,7 +512,7 @@ function init() {
     }
   });
 
-  // Create shadow DOM container (styles are encapsulated inside)
+  // Create shadow DOM container
   ensureShadowRoot();
 
   // Start intercepting files

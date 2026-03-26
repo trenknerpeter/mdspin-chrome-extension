@@ -393,7 +393,24 @@ export function Popup() {
           onClick={toggleInlineButton}
           title={inlineEnabled ? "Inline button: ON — click to disable" : "Inline button: OFF — click to enable"}
         >
-          <span class="text-[10px]" style={{ color: "#888480" }}>Inline</span>
+          {/* Info tooltip */}
+          <div class="relative group" onClick={(e) => e.stopPropagation()}>
+            <span
+              class="flex items-center justify-center rounded-full cursor-help text-[9px] font-bold"
+              style={{ width: "14px", height: "14px", background: "#2A2A2A", color: "#888480" }}
+            >
+              i
+            </span>
+            <div
+              class="absolute top-full right-0 mt-1.5 hidden group-hover:block w-[200px] p-2 rounded-lg text-[10px] leading-snug z-50"
+              style={{ background: "#1A1A1A", color: "#B0ADA8", border: "1px solid #2A2A2A" }}
+            >
+              Spin your file directly inside the prompt window. Works on ChatGPT and Claude.
+            </div>
+          </div>
+          <span class="text-[10px]" style={{ color: "#888480" }}>
+            Inline <span style={{ color: "#666" }}>(beta)</span>
+          </span>
           <div
             class="relative rounded-full transition-colors duration-200"
             style={{ width: "32px", height: "18px", background: inlineEnabled ? "#FF4800" : "#3A3A3A" }}

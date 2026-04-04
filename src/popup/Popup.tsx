@@ -8,6 +8,10 @@ const SUPABASE_ANON_KEY =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml4ZHNkZGZ4a3JreXRpaXRmaWNpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM0MzA5MTAsImV4cCI6MjA4OTAwNjkxMH0.rMQEKVnBkTAM6Dxx3OLXF1s-k_coJfn36IQEAqbh36k";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+// ── Usage limits ───────────────────────────────────────────────────
+const ANON_LIMIT = 3;
+const AUTH_LIMIT = 20;
+
 // ── File conversion constants ───────────────────────────────────────
 const SUPPORTED_TYPES = [
   "application/pdf",
@@ -73,6 +77,9 @@ export function Popup() {
   const [signupSuccess, setSignupSuccess] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
 
+  // Usage / rate limiting
+  const [usage, setUsage] = useState<{ remaining: number; limit: number } | null>(null);
+
   // ── On mount ──────────────────────────────────────────────────────
   useEffect(() => {
     // Load inline toggle preference
@@ -96,15 +103,19 @@ export function Popup() {
 
     // Load existing Supabase session
     supabase.auth.getSession().then(({ data }) => {
-      setUser(data.session?.user ?? null);
+      const sessionUser = data.session?.user ?? null;
+      setUser(sessionUser);
+      loadUsage(sessionUser);
     });
 
     // Listen for auth changes (e.g. after Google OAuth redirect)
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-      if (session?.user) {
+      const sessionUser = session?.user ?? null;
+      setUser(sessionUser);
+      loadUsage(sessionUser);
+      if (sessionUser) {
         setAuthView("none");
         setAuthEmail("");
         setAuthPassword("");
@@ -239,12 +250,10 @@ export function Popup() {
       if (sessionError) {
         setAuthError(sessionError.message);
       } else if (sessionData?.user) {
-        // Explicitly update UI — onAuthStateChange may not fire reliably
-        // when the popup was backgrounded during the auth window
-        setUser(sessionData.user);
-        setAuthView("none");
-        setAuthEmail("");
-        setAuthPassword("");
+        // Reload the popup so getSession() picks up the saved session cleanly.
+        // Chrome often dismisses the popup during launchWebAuthFlow, making
+        // in-place state updates unreliable.
+        window.location.reload();
       }
     } catch (err: any) {
       console.error("[MDSpin Auth] Error:", err);
@@ -261,6 +270,66 @@ export function Popup() {
     await supabase.auth.signOut();
     setUser(null);
     setShowUserMenu(false);
+    loadUsage(null);
+  }
+
+  // ── Usage / rate limiting ─────────────────────────────────────────
+  async function loadUsage(currentUser: User | null) {
+    const todayUtc = new Date().toISOString().split("T")[0];
+    if (!currentUser) {
+      chrome.storage.local.get("dailyUsage", (result) => {
+        const stored = result.dailyUsage as { date: string; count: number } | undefined;
+        const count = stored?.date === todayUtc ? stored.count : 0;
+        setUsage({ remaining: Math.max(0, ANON_LIMIT - count), limit: ANON_LIMIT });
+      });
+    } else {
+      const { data } = await supabase
+        .from("daily_usage")
+        .select("conversion_count")
+        .eq("identifier", currentUser.id)
+        .eq("identifier_type", "user")
+        .eq("date", todayUtc)
+        .maybeSingle();
+      const count = data?.conversion_count ?? 0;
+      setUsage({ remaining: Math.max(0, AUTH_LIMIT - count), limit: AUTH_LIMIT });
+    }
+  }
+
+  async function incrementUsage(currentUser: User | null) {
+    const todayUtc = new Date().toISOString().split("T")[0];
+    if (!currentUser) {
+      chrome.storage.local.get("dailyUsage", (result) => {
+        const stored = result.dailyUsage as { date: string; count: number } | undefined;
+        const count = stored?.date === todayUtc ? stored.count : 0;
+        const newCount = count + 1;
+        chrome.storage.local.set({ dailyUsage: { date: todayUtc, count: newCount } });
+        setUsage({ remaining: Math.max(0, ANON_LIMIT - newCount), limit: ANON_LIMIT });
+      });
+    } else {
+      // Optimistic update
+      setUsage((prev) => (prev ? { ...prev, remaining: Math.max(0, prev.remaining - 1) } : null));
+      // Read current count then write count+1
+      const { data } = await supabase
+        .from("daily_usage")
+        .select("conversion_count")
+        .eq("identifier", currentUser.id)
+        .eq("identifier_type", "user")
+        .eq("date", todayUtc)
+        .maybeSingle();
+      const currentCount = data?.conversion_count ?? 0;
+      await supabase.from("daily_usage").upsert(
+        {
+          identifier: currentUser.id,
+          identifier_type: "user",
+          date: todayUtc,
+          conversion_count: currentCount + 1,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "identifier,identifier_type,date" }
+      );
+      // Reload authoritative count
+      await loadUsage(currentUser);
+    }
   }
 
   // ── File conversion helpers ───────────────────────────────────────
@@ -271,6 +340,20 @@ export function Popup() {
     }
     if (file.size > MAX_FILE_SIZE) {
       setState({ kind: "error", message: "File is too large. Maximum size is 20 MB." });
+      return;
+    }
+    if (usage === null) {
+      // Still loading quota from storage/Supabase — deny to prevent bypass
+      setState({ kind: "error", message: "Checking your conversion quota, please try again." });
+      return;
+    }
+    if (usage.remaining <= 0) {
+      setState({
+        kind: "error",
+        message: user
+          ? `Daily limit of ${usage.limit} conversions reached. Resets at midnight UTC.`
+          : `Daily limit reached. Sign in for ${AUTH_LIMIT} conversions/day.`,
+      });
       return;
     }
     originalFileRef.current = file;
@@ -291,6 +374,7 @@ export function Popup() {
         chrome.storage.local.set({
           lastConversion: { markdownText: response.markdown, fileName: file.name, wordCount, convertedAt: new Date().toISOString() },
         });
+        incrementUsage(user).catch((err) => console.error("[MDSpin] Usage increment failed:", err));
       }
     } catch {
       setState({ kind: "error", message: "Conversion failed. Please try again." });
@@ -700,50 +784,64 @@ export function Popup() {
                   </a>
                 </p>
 
-                {/* Sign-in / user avatar */}
-                {user ? (
-                  <div class="relative">
-                    <button
-                      onClick={() => setShowUserMenu(!showUserMenu)}
-                      class="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold text-white transition-opacity duration-150"
-                      style={{ background: "#FF4800" }}
-                      title={user.email}
+                {/* Usage counter + sign-in / user avatar */}
+                <div class="flex items-center gap-2">
+                  {usage !== null && (
+                    <span
+                      style={{
+                        color: usage.remaining <= 1 ? "#FF4800" : "#888480",
+                        fontSize: "11px",
+                        fontVariantNumeric: "tabular-nums",
+                      }}
+                      title={`${usage.remaining} of ${usage.limit} conversions remaining today`}
                     >
-                      {userInitial}
-                    </button>
-                    {showUserMenu && (
-                      <div
-                        class="absolute bottom-9 right-0 rounded-lg p-3 flex flex-col gap-2 min-w-[160px]"
-                        style={{ background: "#1E1E1E", border: "1px solid #2A2A2A", zIndex: 10 }}
+                      {usage.remaining}/{usage.limit} conversions left
+                    </span>
+                  )}
+                  {user ? (
+                    <div class="relative">
+                      <button
+                        onClick={() => setShowUserMenu(!showUserMenu)}
+                        class="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold text-white transition-opacity duration-150"
+                        style={{ background: "#FF4800" }}
+                        title={user.email}
                       >
-                        <p class="text-[11px] truncate" style={{ color: "#888480" }}>{user.email}</p>
-                        <button
-                          onClick={handleSignOut}
-                          class="text-xs text-left transition-colors duration-150"
-                          style={{ color: "#FF4800" }}
-                          onMouseEnter={(e) => ((e.target as HTMLElement).style.textDecoration = "underline")}
-                          onMouseLeave={(e) => ((e.target as HTMLElement).style.textDecoration = "none")}
+                        {userInitial}
+                      </button>
+                      {showUserMenu && (
+                        <div
+                          class="absolute bottom-9 right-0 rounded-lg p-3 flex flex-col gap-2 min-w-[160px]"
+                          style={{ background: "#1E1E1E", border: "1px solid #2A2A2A", zIndex: 10 }}
                         >
-                          Sign out
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <button
-                    onClick={() => openAuthView("signin")}
-                    title="Sign in"
-                    class="transition-colors duration-150"
-                    style={{ color: "#888480" }}
-                    onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.color = "#F0EDE8")}
-                    onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.color = "#888480")}
-                  >
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
-                      <circle cx="12" cy="7" r="4" />
-                    </svg>
-                  </button>
-                )}
+                          <p class="text-[11px] truncate" style={{ color: "#888480" }}>{user.email}</p>
+                          <button
+                            onClick={handleSignOut}
+                            class="text-xs text-left transition-colors duration-150"
+                            style={{ color: "#FF4800" }}
+                            onMouseEnter={(e) => ((e.target as HTMLElement).style.textDecoration = "underline")}
+                            onMouseLeave={(e) => ((e.target as HTMLElement).style.textDecoration = "none")}
+                          >
+                            Sign out
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => openAuthView("signin")}
+                      title="Sign in"
+                      class="transition-colors duration-150"
+                      style={{ color: "#888480" }}
+                      onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.color = "#F0EDE8")}
+                      onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.color = "#888480")}
+                    >
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                        <circle cx="12" cy="7" r="4" />
+                      </svg>
+                    </button>
+                  )}
+                </div>
               </div>
             )}
           </footer>

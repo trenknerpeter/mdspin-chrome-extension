@@ -49,7 +49,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["icons/logo-32.png"],
+      "resources": ["icons/logo-32.png", "icons/mdspin-logo-128x128.png"],
       "matches": [
         "https://chatgpt.com/*",
         "https://chat.openai.com/*",

@@ -239,11 +239,11 @@ function createShadowHost(): { host: HTMLDivElement; root: ShadowRoot } {
       to { transform: rotate(360deg); }
     }
 
-    .mdspin-btn {
+.mdspin-btn {
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 4px;
+      padding: 0;
       background: transparent;
       border: none;
       border-radius: 10px;
@@ -254,18 +254,31 @@ function createShadowHost(): { host: HTMLDivElement; root: ShadowRoot } {
     }
 
     .mdspin-btn:hover {
-      transform: scale(1.1);
+      transform: scale(1.08);
     }
 
     .mdspin-btn img {
       width: 28px;
       height: 28px;
-      border-radius: 6px;
-      transition: transform 0.3s ease;
+      border-radius: 8px;
+      display: block;
+      box-shadow:
+        0 0 0 1px oklch(0.70 0.20 40 / 0.4),
+        0 4px 14px -4px oklch(0.60 0.22 38 / 0.55);
+      transition: box-shadow 0.2s ease, transform 0.3s ease;
+    }
+
+    .mdspin-btn:hover img {
+      box-shadow:
+        0 0 0 1px oklch(0.74 0.22 42 / 0.6),
+        0 6px 18px -4px oklch(0.60 0.22 38 / 0.75);
     }
 
     .mdspin-btn img.spinning {
       animation: mdspin-rotate 1s linear infinite;
+      box-shadow:
+        0 0 0 1px oklch(0.74 0.22 42 / 0.6),
+        0 0 20px oklch(0.60 0.22 38 / 0.6);
     }
   `;
   root.appendChild(style);
@@ -290,7 +303,7 @@ function createButton(fileName: string): HTMLButtonElement {
   const btn = document.createElement("button");
   btn.className = "mdspin-btn";
 
-  const logoUrl = chrome.runtime.getURL("icons/logo-32.png");
+  const logoUrl = chrome.runtime.getURL("icons/mdspin-logo-128x128.png");
   const img = document.createElement("img");
   img.src = logoUrl;
   img.alt = "MDSpin";

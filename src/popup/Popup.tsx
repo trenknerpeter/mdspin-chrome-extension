@@ -6,6 +6,10 @@ import type { User } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://ixdsddfxkrkytiitfici.supabase.co";
 const SUPABASE_ANON_KEY =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml4ZHNkZGZ4a3JreXRpaXRmaWNpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM0MzA5MTAsImV4cCI6MjA4OTAwNjkxMH0.rMQEKVnBkTAM6Dxx3OLXF1s-k_coJfn36IQEAqbh36k";
+// No `flowType` set → default IMPLICIT OAuth flow, so Google sign-in returns
+// tokens in the URL fragment (#access_token). The service-worker OAuth broker
+// (worker.ts → handleGoogleOAuth) parses that fragment. Do NOT switch to
+// flowType: 'pkce' without updating the broker to exchange the ?code= instead.
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ── Usage limits ───────────────────────────────────────────────────
@@ -142,6 +146,11 @@ export function Popup() {
       }
     });
 
+    // Apply any session the service worker brokered while this popup was closed
+    // during a Google sign-in. Runs after the subscription above so setSession's
+    // SIGNED_IN event is caught.
+    consumePendingAuth();
+
     return () => subscription.unsubscribe();
   }, []);
 
@@ -197,6 +206,23 @@ export function Popup() {
     setAuthLoading(false);
   }
 
+  // Apply a session the service worker brokered during Google sign-in. The SW
+  // stashes the OAuth tokens in chrome.storage.local.pendingAuth (the popup
+  // closes when the auth window steals focus, so it can't finish the flow
+  // itself). Called on popup mount and right after a brokered flow returns.
+  async function consumePendingAuth() {
+    const { pendingAuth } = await chrome.storage.local.get("pendingAuth");
+    if (!pendingAuth?.access_token || !pendingAuth?.refresh_token) return;
+    // Remove before applying so a bad/expired token can't cause a retry loop.
+    await chrome.storage.local.remove("pendingAuth");
+    const { error } = await supabase.auth.setSession({
+      access_token: pendingAuth.access_token,
+      refresh_token: pendingAuth.refresh_token,
+    });
+    if (error) setAuthError(error.message);
+    // On success, onAuthStateChange updates the user, usage, and mirrored token.
+  }
+
   async function handleGoogleSignIn() {
     setAuthLoading(true);
     setAuthError(null);
@@ -217,39 +243,21 @@ export function Popup() {
         return;
       }
 
-      const responseUrl = await new Promise<string>((resolve, reject) => {
-        chrome.identity.launchWebAuthFlow(
-          { url: data.url, interactive: true },
-          (callbackUrl) => {
-            if (chrome.runtime.lastError || !callbackUrl) {
-              reject(new Error(chrome.runtime.lastError?.message ?? "Auth cancelled"));
-            } else {
-              resolve(callbackUrl);
-            }
-          }
-        );
-      });
+      // Hand the OAuth URL to the service worker. It runs launchWebAuthFlow,
+      // which survives this popup closing when the auth window takes focus, and
+      // stashes the returned tokens in chrome.storage.local.pendingAuth.
+      const result = await chrome.runtime.sendMessage({ type: "GOOGLE_OAUTH", url: data.url });
 
-      const fragment = responseUrl.includes("#") ? responseUrl.split("#")[1] : responseUrl.split("?")[1];
-      const hashParams = new URLSearchParams(fragment);
-      const access_token = hashParams.get("access_token");
-      const refresh_token = hashParams.get("refresh_token");
-
-      if (!access_token || !refresh_token) {
-        setAuthError("No tokens received from Google sign-in");
-        setAuthLoading(false);
-        return;
-      }
-
-      const { data: sessionData, error: sessionError } = await supabase.auth.setSession({
-        access_token,
-        refresh_token,
-      });
-
-      if (sessionError) {
-        setAuthError(sessionError.message);
-      } else if (sessionData?.user) {
-        window.location.reload();
+      // This only runs if the popup happened to survive the flow; otherwise the
+      // tokens are applied by consumePendingAuth() on the next popup open.
+      if (result?.ok) {
+        await consumePendingAuth();
+      } else if (
+        result?.error &&
+        !result.error.includes("cancelled") &&
+        !result.error.includes("closed")
+      ) {
+        setAuthError(result.error);
       }
     } catch (err: any) {
       if (!err.message?.includes("cancelled") && !err.message?.includes("closed")) {

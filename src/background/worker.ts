@@ -28,6 +28,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "GOOGLE_OAUTH") {
+    handleGoogleOAuth(message.url)
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+
   if (message.type === "CONVERT_FILE") {
     console.log("[MDSpin BG] Received CONVERT_FILE:", message.fileName);
     convertFile(message)
@@ -231,6 +238,48 @@ function geminiMainWorldInjectFile(markdown: string, _mdFilename: string): boole
 
   console.log(`${TAG} Text inserted via direct DOM`);
   return true;
+}
+
+/**
+ * Run the interactive Google OAuth flow from the service worker. The SW is not
+ * tied to the popup's focus, so it survives the popup closing when the auth
+ * window steals focus (the bug where sign-in only worked with DevTools open).
+ * Stashes the returned tokens in chrome.storage.local.pendingAuth for the popup
+ * to apply via setSession on its next open.
+ */
+async function handleGoogleOAuth(url: string): Promise<{ ok: boolean; error?: string }> {
+  let redirectUrl: string;
+  try {
+    redirectUrl = await new Promise<string>((resolve, reject) => {
+      chrome.identity.launchWebAuthFlow({ url, interactive: true }, (callbackUrl) => {
+        if (chrome.runtime.lastError || !callbackUrl) {
+          reject(new Error(chrome.runtime.lastError?.message ?? "Auth cancelled"));
+        } else {
+          resolve(callbackUrl);
+        }
+      });
+    });
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+
+  // The popup's Supabase client uses the default IMPLICIT flow, so tokens arrive
+  // in the URL fragment (#access_token); the query-string branch is just a
+  // tolerant fallback. If the client ever switches to flowType: 'pkce', the
+  // redirect carries ?code= and this must exchange it, not parse tokens here.
+  const fragment = redirectUrl.includes("#")
+    ? redirectUrl.split("#")[1]
+    : redirectUrl.split("?")[1];
+  const params = new URLSearchParams(fragment ?? "");
+  const access_token = params.get("access_token");
+  const refresh_token = params.get("refresh_token");
+
+  if (!access_token || !refresh_token) {
+    return { ok: false, error: params.get("error_description") || "No tokens in OAuth redirect" };
+  }
+
+  await chrome.storage.local.set({ pendingAuth: { access_token, refresh_token } });
+  return { ok: true };
 }
 
 /**

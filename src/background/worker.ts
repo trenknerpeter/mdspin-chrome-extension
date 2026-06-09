@@ -284,11 +284,15 @@ async function convertFile(message: {
   // The proxy sends X-RateLimit-* on both success and 429, so parse once here and
   // surface quota to the popup in either case. Number(null) is 0 (and passes
   // Number.isFinite), so guard on header presence, not the parsed number.
-  const limitHeader = response.headers.get("X-RateLimit-Limit");
-  const remainingHeader = response.headers.get("X-RateLimit-Remaining");
+  const limit = Number(response.headers.get("X-RateLimit-Limit"));
+  const remaining = Number(response.headers.get("X-RateLimit-Remaining"));
+  // Only surface quota when both headers parsed to real numbers. Number(null) is 0
+  // (so an absent header would slip past Number.isFinite alone) AND a malformed
+  // header yields NaN — requiring both finite guards against each case. The proxy
+  // always sends valid integers on 2xx/429, so this is purely defensive.
   const rateLimit =
-    limitHeader !== null && remainingHeader !== null
-      ? { limit: Number(limitHeader), remaining: Number(remainingHeader) }
+    Number.isFinite(limit) && Number.isFinite(remaining) && limit > 0
+      ? { limit, remaining }
       : undefined;
 
   if (!response.ok) {

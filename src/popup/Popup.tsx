@@ -262,6 +262,9 @@ export function Popup() {
 
   async function handleSignOut() {
     await supabase.auth.signOut();
+    // Explicitly clear the mirrored token so a signed-out user's JWT can never
+    // linger in storage (onAuthStateChange clears it too, but don't rely on that).
+    chrome.storage.local.remove("mdspinSession");
     setUser(null);
     setShowUserMenu(false);
     loadUsage(null);

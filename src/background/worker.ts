@@ -233,11 +233,28 @@ function geminiMainWorldInjectFile(markdown: string, _mdFilename: string): boole
   return true;
 }
 
+/**
+ * Resolve a Supabase access token for the conversion request.
+ * Popup conversions pass a fresh token in the message. Inline (content-script)
+ * conversions have none, so fall back to the session the popup mirrored into
+ * chrome.storage.local — but only if it has not expired.
+ */
+async function getAccessToken(messageToken?: string | null): Promise<string | null> {
+  if (messageToken) return messageToken;
+  const { mdspinSession } = await chrome.storage.local.get("mdspinSession");
+  if (mdspinSession?.access_token && typeof mdspinSession.expires_at === "number") {
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (mdspinSession.expires_at > nowSec + 30) return mdspinSession.access_token;
+  }
+  return null;
+}
+
 async function convertFile(message: {
   fileName: string;
   fileData: string;
   fileType: string;
-}): Promise<{ markdown?: string; error?: string }> {
+  accessToken?: string | null;
+}): Promise<{ markdown?: string; error?: string; rateLimit?: { limit: number; remaining: number } }> {
   console.log("[MDSpin BG] Calling API...");
 
   // The web proxy expects multipart/form-data with a `file` field. Decode the
@@ -247,11 +264,16 @@ async function convertFile(message: {
   const form = new FormData();
   form.append("file", new Blob([bytes], { type: mimeType }), message.fileName);
 
+  // Attach the user's Supabase token when signed in — the proxy uses it to
+  // resolve per-user quota. Anonymous conversions send no header (unchanged).
+  const headers: Record<string, string> = {};
+  const token = await getAccessToken(message.accessToken);
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
   let response: Response;
   try {
-    // No Authorization header — the proxy holds the key server-side.
     // Do NOT set Content-Type; fetch sets the multipart boundary itself.
-    response = await fetch(API_URL, { method: "POST", body: form });
+    response = await fetch(API_URL, { method: "POST", body: form, headers });
   } catch (err) {
     console.error("[MDSpin BG] Fetch failed:", err);
     return { error: `Network error: ${err}` };
@@ -259,15 +281,25 @@ async function convertFile(message: {
 
   console.log("[MDSpin BG] Status:", response.status);
 
+  // The proxy sends X-RateLimit-* on both success and 429, so parse once here and
+  // surface quota to the popup in either case. Number(null) is 0 (and passes
+  // Number.isFinite), so guard on header presence, not the parsed number.
+  const limitHeader = response.headers.get("X-RateLimit-Limit");
+  const remainingHeader = response.headers.get("X-RateLimit-Remaining");
+  const rateLimit =
+    limitHeader !== null && remainingHeader !== null
+      ? { limit: Number(limitHeader), remaining: Number(remainingHeader) }
+      : undefined;
+
   if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    console.error("[MDSpin BG] Error body:", text);
+    const errorText = await response.text().catch(() => "");
+    console.error("[MDSpin BG] Error body:", errorText);
     // The proxy returns JSON like {"error":"...","message":"..."} — prefer the
     // human-readable message over the raw body.
-    let message = text;
+    let errorMessage = errorText;
     try {
-      const parsed = JSON.parse(text);
-      message = parsed.message || parsed.error || text;
+      const parsed = JSON.parse(errorText);
+      errorMessage = parsed.message || parsed.error || errorText;
     } catch {
       /* non-JSON body — fall back to raw text */
     }
@@ -278,16 +310,16 @@ async function convertFile(message: {
       return { error: "This file type is not supported by the server." };
     }
     if (response.status === 429) {
-      return { error: message || "Daily conversion limit reached. Try again later." };
+      return { error: errorMessage || "Daily conversion limit reached. Try again later.", rateLimit };
     }
     return {
-      error: message || `Conversion failed (HTTP ${response.status}). Please try again.`,
+      error: errorMessage || `Conversion failed (HTTP ${response.status}). Please try again.`,
     };
   }
 
   const data = await response.json();
   console.log("[MDSpin BG] Response keys:", Object.keys(data));
-  return { markdown: data.markdown_text ?? "" };
+  return { markdown: data.markdown_text ?? "", rateLimit };
 }
 
 function guessMimeType(fileName: string): string {

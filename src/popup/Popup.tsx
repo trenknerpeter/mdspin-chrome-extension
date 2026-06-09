@@ -12,6 +12,24 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const ANON_LIMIT = 3;
 const AUTH_LIMIT = 20;
 
+// Mirror the Supabase session into chrome.storage.local so the service worker
+// (and inline content-script conversions) can read the access token. The popup
+// is the ONLY context that refreshes tokens, avoiding refresh-token races.
+function mirrorSession(
+  session: { access_token: string; expires_at?: number } | null
+) {
+  if (session?.access_token && typeof session.expires_at === "number") {
+    chrome.storage.local.set({
+      mdspinSession: {
+        access_token: session.access_token,
+        expires_at: session.expires_at,
+      },
+    });
+  } else {
+    chrome.storage.local.remove("mdspinSession");
+  }
+}
+
 // ── File conversion constants ───────────────────────────────────────
 const SUPPORTED_TYPES = [
   "application/pdf",
@@ -104,6 +122,7 @@ export function Popup() {
     });
 
     supabase.auth.getSession().then(({ data }) => {
+      mirrorSession(data.session);
       const sessionUser = data.session?.user ?? null;
       setUser(sessionUser);
       loadUsage(sessionUser);
@@ -112,6 +131,7 @@ export function Popup() {
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
+      mirrorSession(session);
       const sessionUser = session?.user ?? null;
       setUser(sessionUser);
       loadUsage(sessionUser);
@@ -269,37 +289,33 @@ export function Popup() {
     }
   }
 
-  async function incrementUsage(currentUser: User | null) {
-    const todayUtc = new Date().toISOString().split("T")[0];
+  // Record usage after a conversion. The proxy is the SINGLE writer to
+  // daily_usage, so authenticated users get NO client-side DB write here
+  // (that was the double-count bug). Display is driven by the proxy's
+  // authoritative X-RateLimit-* headers, surfaced by the worker as `rateLimit`.
+  function recordUsage(
+    currentUser: User | null,
+    rateLimit?: { limit: number; remaining: number }
+  ) {
+    if (rateLimit && Number.isFinite(rateLimit.remaining)) {
+      setUsage({ remaining: Math.max(0, rateLimit.remaining), limit: rateLimit.limit });
+    } else {
+      // Fallback if headers were unavailable: optimistic local decrement.
+      setUsage((prev) =>
+        prev ? { ...prev, remaining: Math.max(0, prev.remaining - 1) } : prev
+      );
+    }
+
+    // Anonymous users have no per-user row in the popup's view, so keep a local
+    // counter for display persistence across popup reopens (the proxy's IP limit
+    // is the real enforcement). Authenticated users persist via the proxy only.
     if (!currentUser) {
+      const todayUtc = new Date().toISOString().split("T")[0];
       chrome.storage.local.get("dailyUsage", (result) => {
         const stored = result.dailyUsage as { date: string; count: number } | undefined;
         const count = stored?.date === todayUtc ? stored.count : 0;
-        const newCount = count + 1;
-        chrome.storage.local.set({ dailyUsage: { date: todayUtc, count: newCount } });
-        setUsage({ remaining: Math.max(0, ANON_LIMIT - newCount), limit: ANON_LIMIT });
+        chrome.storage.local.set({ dailyUsage: { date: todayUtc, count: count + 1 } });
       });
-    } else {
-      setUsage((prev) => (prev ? { ...prev, remaining: Math.max(0, prev.remaining - 1) } : null));
-      const { data } = await supabase
-        .from("daily_usage")
-        .select("conversion_count")
-        .eq("identifier", currentUser.id)
-        .eq("identifier_type", "user")
-        .eq("date", todayUtc)
-        .maybeSingle();
-      const currentCount = data?.conversion_count ?? 0;
-      await supabase.from("daily_usage").upsert(
-        {
-          identifier: currentUser.id,
-          identifier_type: "user",
-          date: todayUtc,
-          conversion_count: currentCount + 1,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "identifier,identifier_type,date" }
-      );
-      await loadUsage(currentUser);
     }
   }
 
@@ -330,21 +346,31 @@ export function Popup() {
     setState({ kind: "converting", fileName: file.name });
     chrome.storage.local.remove("lastConversion");
     try {
+      const { data: { session } } = await supabase.auth.getSession();
+      mirrorSession(session); // keep the worker's mirrored token fresh
       const response = await chrome.runtime.sendMessage({
         type: "CONVERT_FILE",
         fileName: file.name,
         fileData: await fileToBase64(file),
         fileType: file.type,
+        accessToken: session?.access_token ?? null,
       });
       if (response.error) {
         setState({ kind: "error", message: response.error });
+        // On a 429 the worker surfaces rateLimit so we can correct the footer to 0.
+        if (response.rateLimit && Number.isFinite(response.rateLimit.remaining)) {
+          setUsage({
+            remaining: Math.max(0, response.rateLimit.remaining),
+            limit: response.rateLimit.limit,
+          });
+        }
       } else {
         const wordCount = countWords(response.markdown);
         setState({ kind: "result", markdown: response.markdown, fileName: file.name, wordCount });
         chrome.storage.local.set({
           lastConversion: { markdownText: response.markdown, fileName: file.name, wordCount, convertedAt: new Date().toISOString() },
         });
-        incrementUsage(user).catch((err) => console.error("[MDSpin] Usage increment failed:", err));
+        recordUsage(user, response.rateLimit);
       }
     } catch {
       setState({ kind: "error", message: "Conversion failed. Please try again." });

@@ -1,5 +1,7 @@
-const API_URL = "https://mdc-api-murex.vercel.app/v1/convert/attachment";
-const API_KEY = "ac6c6f8590ff760c98d519ab34198d6282bbdac2a056a809bbf74329630b474d";
+// Convert via the MDSpin web proxy. The proxy injects the backend key
+// server-side and rate-limits, so the extension ships NO secret — a backend
+// key rotation can never break already-shipped extensions again.
+const API_URL = "https://www.mdspin.app/api/convert";
 
 console.log("[MDSpin BG] Service worker loaded");
 
@@ -238,20 +240,18 @@ async function convertFile(message: {
 }): Promise<{ markdown?: string; error?: string }> {
   console.log("[MDSpin BG] Calling API...");
 
+  // The web proxy expects multipart/form-data with a `file` field. Decode the
+  // base64 payload into a Blob and upload it as a real file.
+  const mimeType = message.fileType || guessMimeType(message.fileName);
+  const bytes = Uint8Array.from(atob(message.fileData), (c) => c.charCodeAt(0));
+  const form = new FormData();
+  form.append("file", new Blob([bytes], { type: mimeType }), message.fileName);
+
   let response: Response;
   try {
-    response = await fetch(API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${API_KEY}`,
-      },
-      body: JSON.stringify({
-        file_data: message.fileData,
-        filename: message.fileName,
-        mime_type: message.fileType || guessMimeType(message.fileName),
-      }),
-    });
+    // No Authorization header — the proxy holds the key server-side.
+    // Do NOT set Content-Type; fetch sets the multipart boundary itself.
+    response = await fetch(API_URL, { method: "POST", body: form });
   } catch (err) {
     console.error("[MDSpin BG] Fetch failed:", err);
     return { error: `Network error: ${err}` };
@@ -262,14 +262,26 @@ async function convertFile(message: {
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     console.error("[MDSpin BG] Error body:", text);
+    // The proxy returns JSON like {"error":"...","message":"..."} — prefer the
+    // human-readable message over the raw body.
+    let message = text;
+    try {
+      const parsed = JSON.parse(text);
+      message = parsed.message || parsed.error || text;
+    } catch {
+      /* non-JSON body — fall back to raw text */
+    }
     if (response.status === 413) {
       return { error: "File is too large for the server to process." };
     }
     if (response.status === 415) {
       return { error: "This file type is not supported by the server." };
     }
+    if (response.status === 429) {
+      return { error: message || "Daily conversion limit reached. Try again later." };
+    }
     return {
-      error: text || `Conversion failed (HTTP ${response.status}). Please try again.`,
+      error: message || `Conversion failed (HTTP ${response.status}). Please try again.`,
     };
   }
 

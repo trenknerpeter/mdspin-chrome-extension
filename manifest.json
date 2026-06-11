@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "MDSpin — File to Markdown Converter",
   "description": "Convert files to markdown directly in AI chat interfaces. Powered by MDSpin.",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "icons": {
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",

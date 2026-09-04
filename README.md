@@ -4,6 +4,16 @@ A Chrome extension that converts files to Markdown directly inside AI chat inter
 
 Powered by [MDSpin](https://www.mdspin.app).
 
+**[Install from the Chrome Web Store](https://chromewebstore.google.com/detail/mdspin-%E2%80%94-file-to-markdown/jmiinicnfjhndcmmiominecphddngjae)**
+
+## Screenshots
+
+<p>
+  <img src="docs/screenshots/drop.png" width="260" alt="Drop a file to convert" />
+  <img src="docs/screenshots/converting.png" width="260" alt="Converting" />
+  <img src="docs/screenshots/result.png" width="260" alt="Markdown result, ready to copy or save" />
+</p>
+
 ## Features
 
 - Converts dropped/selected files to Markdown without leaving the chat page
